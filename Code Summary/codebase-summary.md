@@ -60,7 +60,7 @@ Notion Second Brain (Code)/
 |---|---|---|
 | Embedding model | `all-MiniLM-L6-v2` | Local, ~90MB, 384-dim vectors, no API cost |
 | Vector store | ChromaDB PersistentClient | `data/chroma/`, cosine similarity (`hnsw:space: cosine`) |
-| LLM | `claude-sonnet-4-6` | Anthropic API, streaming via `messages.stream()` |
+| LLM | `claude-sonnet-4-6` | OpenRouter API (OpenAI-compatible client), streaming via `chat.completions.create()` |
 | Chunk size | 350 words, 50-word overlap | Balances coherence vs retrieval precision |
 | Structured DB | SQLite | diary_entries, media_logs, chat_sessions |
 | Session management | JSON in SQLite `chat_sessions` | Chat history persists across app restarts |
@@ -133,7 +133,7 @@ RAG chat with session history.
 Flow:
 1. User types → retrieve top-N chunks from ChromaDB
 2. Build `api_messages`: last 6 turns of history + current query with `<retrieved_notes>` block
-3. Stream response via `claude.messages.stream()`
+3. Stream response via OpenRouter `openrouter.chat.completions.create(stream=True)`
 4. Save messages + chunk metadata to `chat_sessions` in SQLite
 
 Session management: create session on first message, title = first 60 chars of query. Sidebar lists sessions with delete button.
