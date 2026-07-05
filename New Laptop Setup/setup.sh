@@ -105,24 +105,35 @@ echo ""
 ok "All packages installed"
 echo ""
 
-# ── Step 4: API key ───────────────────────────────────────────────────────────
-step 4 "Configuring Anthropic API key"
+# ── Step 4: API keys ──────────────────────────────────────────────────────────
+step 4 "Configuring API keys"
 echo ""
 
-if [ -f ".env" ] && grep -q "ANTHROPIC_API_KEY" .env && ! grep -q "ANTHROPIC_API_KEY=$" .env; then
+if [ -f ".env" ] && grep -q "OPENROUTER_API_KEY" .env && grep -q "NOTION_TOKEN" .env; then
     ok ".env already configured — skipping"
 else
-    echo "  The chat feature needs your Anthropic API key."
-    echo "  Get one at: https://console.anthropic.com/"
-    echo ""
-    read -rp "  Paste your ANTHROPIC_API_KEY and press Enter: " API_KEY
+    echo "  The app needs three keys. Get them from:"
+    echo "    Notion token:       https://www.notion.so/my-integrations"
+    echo "    OpenRouter key:     https://openrouter.ai/keys"
+    echo "    Anthropic key:      https://console.anthropic.com/"
     echo ""
 
-    if [ -z "$API_KEY" ]; then
-        warn "No key entered. You can add it later by creating a .env file:"
-        info "  echo \"ANTHROPIC_API_KEY=sk-ant-...\" > .env"
+    read -rp "  Paste your NOTION_TOKEN and press Enter: " NOTION_KEY
+    read -rp "  Paste your OPENROUTER_API_KEY and press Enter: " OR_KEY
+    read -rp "  Paste your ANTHROPIC_API_KEY and press Enter: " ANT_KEY
+    echo ""
+
+    if [ -z "$NOTION_KEY" ] && [ -z "$OR_KEY" ] && [ -z "$ANT_KEY" ]; then
+        warn "No keys entered. Create a .env file manually before running the app:"
+        info "  NOTION_TOKEN=..."
+        info "  OPENROUTER_API_KEY=sk-or-v1-..."
+        info "  ANTHROPIC_API_KEY=sk-ant-..."
     else
-        echo "ANTHROPIC_API_KEY=$API_KEY" > .env
+        {
+            [ -n "$NOTION_KEY" ] && echo "NOTION_TOKEN=$NOTION_KEY"
+            [ -n "$OR_KEY" ]     && echo "OPENROUTER_API_KEY=$OR_KEY"
+            [ -n "$ANT_KEY" ]    && echo "ANTHROPIC_API_KEY=$ANT_KEY"
+        } > .env
         ok ".env created"
     fi
 fi
