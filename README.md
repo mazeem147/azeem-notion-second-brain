@@ -6,7 +6,7 @@ A local Streamlit RAG app that imports your Notion notes, embeds them locally, a
 
 - **Chat** — ask questions across all your Notion notes using semantic search + Claude
 - **Daily Diary** — 5-question interview flow with Claude synthesis; speak any answer with the mic (mixed Urdu/English transcribed and translated to English)
-- **Media Log** — log books, podcasts, videos with AI follow-up questions
+- **Media Log** — log books, podcasts, videos with AI follow-up questions; speak your reaction or the follow-up answer with the mic too
 - **Sync** — pull new Notion pages and rebuild the vector index
 
 ## Stack
