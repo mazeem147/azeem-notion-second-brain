@@ -115,3 +115,4 @@ websocket-client==1.9.0
 websockets==15.0.1
 zipp==3.23.1
 openai
+pytest==8.4.2
