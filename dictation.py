@@ -32,7 +32,12 @@ import os
 import re
 
 import httpx
+from dotenv import load_dotenv
 from openai import OpenAI
+
+# Load .env so the module is self-sufficient when imported outside the Streamlit
+# app (a script, the test suite), matching connections.py / notion_import.py.
+load_dotenv()
 
 # ── Polish configuration ──────────────────────────────────────────────────────
 
@@ -121,8 +126,12 @@ def _transcribe_and_translate(audio_bytes: bytes) -> str:
     Returns the Raw Transcript verbatim — Whisper's exact output, unstripped, so
     the record preserved in markdown is truly what was said.
     """
+    # Read the key outside the try: a missing OPENAI_API_KEY is a configuration
+    # error and should surface as such, not be dressed up as a transcription
+    # failure (which would wrongly imply the audio or the Whisper call was at fault).
+    api_key = os.environ["OPENAI_API_KEY"]
     try:
-        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        client = OpenAI(api_key=api_key)
         buf = io.BytesIO(audio_bytes)
         buf.name = "recording.wav"
         result = client.audio.translations.create(model="whisper-1", file=buf)

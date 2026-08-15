@@ -115,6 +115,15 @@ def test_transcription_error_message_is_clear(wire):
     assert "transcription failed" in str(exc.value).lower()
 
 
+def test_missing_openai_key_is_a_config_error_not_a_transcription_failure(wire, monkeypatch):
+    # A missing key is a misconfiguration, not a Whisper failure — it must not be
+    # dressed up as a TranscriptionError (which would blame the audio/the call).
+    wire()
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with pytest.raises(KeyError):
+        dictation.dictate(b"audio", mode="diary")
+
+
 # ── A Polish failure preserves the raw transcript (Stories 12, 17) ────────────
 
 def test_polish_exception_falls_back_to_raw_transcript(wire):
