@@ -2,6 +2,7 @@
 pages/diary.py — Daily Diary mode.
 """
 
+import hashlib
 import os
 import sys
 import datetime
@@ -14,6 +15,8 @@ sys.path.insert(0, ROOT)
 from db import init_db, get_conn
 from embed_utils import upsert_document, load_embed_model, load_collection
 from connections import find_connections, explain_connections
+from dictation import dictate, TranscriptionError
+from diary_markdown import build_raw_transcript_section
 from ui import question_card, connection_card
 
 RAW_DIARY_DIR = os.path.join(ROOT, "data", "raw", "diary")
@@ -43,6 +46,68 @@ def synthesize_entry(questions, answers):
     return response.content[0].text.strip()
 
 
+# ---------------------------------------------------------------------------
+# Voice Capture
+# ---------------------------------------------------------------------------
+
+def _capture_voice_answer(step):
+    """Render the mic for answer ``step`` and, on a new recording, inject the
+    Polished Text into ``answer_{step}`` before the text area below renders.
+
+    Voice Capture is optional and additive — a failure never blocks typing. We
+    hash the audio bytes so a given take is transcribed exactly once: later reruns
+    (e.g. the user editing the polished text) neither re-transcribe nor clobber
+    those edits. Needs ``OPENAI_API_KEY`` in ``.env`` for Whisper; without it the
+    mic still renders but every take falls into the graceful error path below.
+    """
+    recording = st.audio_input(
+        "Record your answer",
+        key=f"audio_{step}",
+        label_visibility="collapsed",
+    )
+    if recording is None:
+        return
+
+    audio_bytes = recording.getvalue()
+    audio_hash = hashlib.md5(audio_bytes).hexdigest()
+    if st.session_state.get(f"audio_hash_{step}") == audio_hash:
+        return  # already handled this take — don't overwrite the user's edits
+    st.session_state[f"audio_hash_{step}"] = audio_hash
+
+    try:
+        with st.spinner("Transcribing and polishing…"):
+            result = dictate(audio_bytes, mode="diary")
+    except TranscriptionError as exc:
+        # Graceful fallback: surface the error, leave the field typeable, let the
+        # user re-record. Voice failing must never block writing the entry.
+        st.session_state[f"dictation_error_{step}"] = str(exc)
+        return
+
+    st.session_state.pop(f"dictation_error_{step}", None)
+    # Written before the text area below is instantiated, so the Polished Text
+    # lands in the editable field on this run. The Raw Transcript rides along to
+    # be appended, per-answer, to the entry's markdown on save.
+    st.session_state[f"answer_{step}"] = result["polished_text"]
+    st.session_state[f"raw_transcript_{step}"] = result["raw_transcript"]
+
+
+def _reset_diary_flow():
+    """Return the diary flow to a clean slate, clearing per-answer widget and
+    Voice Capture state so a new entry never inherits a previous one's text or a
+    stale recording. Safe to call from the reset buttons: none of the per-step
+    widgets are instantiated on those views, so deleting their keys can't conflict
+    with an on-page widget."""
+    st.session_state.diary_step = 0
+    st.session_state.diary_answers = []
+    st.session_state.diary_raw_transcripts = []
+    st.session_state.diary_saved = False
+    st.session_state.diary_connections = []
+    st.session_state.diary_full_content = ""
+    for i in range(len(QUESTIONS)):
+        for prefix in ("answer_", "audio_", "audio_hash_", "raw_transcript_", "dictation_error_"):
+            st.session_state.pop(f"{prefix}{i}", None)
+
+
 init_db()
 os.makedirs(RAW_DIARY_DIR, exist_ok=True)
 
@@ -55,6 +120,8 @@ if "diary_step" not in st.session_state:
     st.session_state.diary_step = 0
 if "diary_answers" not in st.session_state:
     st.session_state.diary_answers = []
+if "diary_raw_transcripts" not in st.session_state:
+    st.session_state.diary_raw_transcripts = []
 if "diary_saved" not in st.session_state:
     st.session_state.diary_saved = False
 if "diary_connections" not in st.session_state:
@@ -110,9 +177,7 @@ if existing and not st.session_state.diary_saved:
     </div>
     """, unsafe_allow_html=True)
     if st.button("Write another entry anyway"):
-        st.session_state.diary_step = 0
-        st.session_state.diary_answers = []
-        st.session_state.diary_saved = False
+        _reset_diary_flow()
         st.rerun()
     st.stop()
 
@@ -139,18 +204,32 @@ if not st.session_state.diary_saved and step < total:
 
     question_card(QUESTIONS[step])
 
+    # Voice Capture — speak this answer instead of typing. Must run before the
+    # text area so a fresh recording's Polished Text is injected into answer_{step}
+    # in time to show in the editable field on this run.
+    _capture_voice_answer(step)
+
     answer = st.text_area(
         "Your answer",
         key=f"answer_{step}",
         height=130,
-        placeholder="Write freely — this is just for you.",
+        placeholder="Write freely, or tap the mic above — this is just for you.",
         label_visibility="collapsed",
     )
+
+    if st.session_state.get(f"dictation_error_{step}"):
+        st.error(
+            "Voice transcription failed — type your answer instead, or re-record. "
+            f"({st.session_state[f'dictation_error_{step}']})"
+        )
 
     col1, col2 = st.columns([1, 6])
     with col1:
         if st.button("Next →", type="primary", disabled=not answer.strip()):
             st.session_state.diary_answers.append(answer.strip())
+            st.session_state.diary_raw_transcripts.append(
+                st.session_state.get(f"raw_transcript_{step}", "")
+            )
             st.session_state.diary_step += 1
             st.rerun()
 
@@ -195,12 +274,18 @@ elif not st.session_state.diary_saved and step == total:
                 )
                 conn.commit()
 
+            # Per-answer Raw Transcript for any spoken answers, appended to the
+            # markdown record only — never embedded (upsert_document below still
+            # sees just the synthesis, so voice and typed entries index identically).
+            raw_section = build_raw_transcript_section(
+                QUESTIONS, st.session_state.diary_raw_transcripts
+            )
             filename = f"diary-{today}.md"
             filepath = os.path.join(RAW_DIARY_DIR, filename)
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(
                     f"---\ntitle: Diary {today}\ncreated: {today}\nsource: diary\n---\n\n"
-                    f"{synthesis}\n\n---\n\n{full_content}"
+                    f"{synthesis}\n\n---\n\n{full_content}{raw_section}"
                 )
 
             upsert_document(
@@ -231,8 +316,7 @@ elif not st.session_state.diary_saved and step == total:
 
     with col2:
         if st.button("↩ Start over"):
-            st.session_state.diary_step = 0
-            st.session_state.diary_answers = []
+            _reset_diary_flow()
             st.rerun()
 
 # ---------------------------------------------------------------------------
@@ -269,9 +353,5 @@ elif st.session_state.diary_saved:
 
     st.markdown("---")
     if st.button("Done"):
-        st.session_state.diary_step = 0
-        st.session_state.diary_answers = []
-        st.session_state.diary_saved = False
-        st.session_state.diary_connections = []
-        st.session_state.diary_full_content = ""
+        _reset_diary_flow()
         st.rerun()

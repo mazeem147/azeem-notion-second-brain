@@ -5,7 +5,7 @@ A local Streamlit RAG app that imports your Notion notes, embeds them locally, a
 ## Features
 
 - **Chat** — ask questions across all your Notion notes using semantic search + Claude
-- **Daily Diary** — 5-question interview flow with Claude synthesis
+- **Daily Diary** — 5-question interview flow with Claude synthesis; speak any answer with the mic (mixed Urdu/English transcribed and translated to English)
 - **Media Log** — log books, podcasts, videos with AI follow-up questions
 - **Sync** — pull new Notion pages and rebuild the vector index
 
@@ -33,6 +33,7 @@ A local Streamlit RAG app that imports your Notion notes, embeds them locally, a
    NOTION_TOKEN=...
    ANTHROPIC_API_KEY=...
    OPENROUTER_API_KEY=...
+   OPENAI_API_KEY=...   # only needed for the diary/media voice mic (Whisper)
    ```
 4. Import Notion pages and build the index:
    ```bash
