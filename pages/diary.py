@@ -103,6 +103,7 @@ def _reset_diary_flow():
     st.session_state.diary_saved = False
     st.session_state.diary_connections = []
     st.session_state.diary_full_content = ""
+    st.session_state.diary_override_existing = False
     for i in range(len(QUESTIONS)):
         for prefix in ("answer_", "audio_", "audio_hash_", "raw_transcript_", "dictation_error_"):
             st.session_state.pop(f"{prefix}{i}", None)
@@ -128,6 +129,8 @@ if "diary_connections" not in st.session_state:
     st.session_state.diary_connections = []
 if "diary_full_content" not in st.session_state:
     st.session_state.diary_full_content = ""
+if "diary_override_existing" not in st.session_state:
+    st.session_state.diary_override_existing = False
 
 today = datetime.date.today().isoformat()
 
@@ -165,7 +168,7 @@ with get_conn() as conn:
         "SELECT id FROM diary_entries WHERE date = ?", (today,)
     ).fetchone()
 
-if existing and not st.session_state.diary_saved:
+if existing and not st.session_state.diary_saved and not st.session_state.diary_override_existing:
     st.markdown("""
     <div style="
       background:#f0edff;border:1px solid #e0daf8;border-radius:9px;
@@ -178,6 +181,7 @@ if existing and not st.session_state.diary_saved:
     """, unsafe_allow_html=True)
     if st.button("Write another entry anyway"):
         _reset_diary_flow()
+        st.session_state.diary_override_existing = True
         st.rerun()
     st.stop()
 
