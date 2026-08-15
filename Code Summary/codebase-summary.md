@@ -1,6 +1,6 @@
 # Notion Second Brain — Codebase Summary
 
-A local Streamlit webapp that imports Notion notes, embeds them with a local model, and lets you chat with your own notes via Claude API (RAG). Portable — runs from a single folder.
+A local Streamlit webapp that imports Notion notes, embeds them with a local model, and lets you chat with your own notes via Claude API (RAG). Portable — runs from a single folder. Diary and Media entries can be captured by voice: speak in mixed Urdu/English and the app transcribes, translates to English, and polishes the text into the editable field (see [Voice Capture](#voice-capture-dictation)).
 
 **Run command:**
 ```bash
@@ -32,22 +32,29 @@ Notion Second Brain (Code)/
 ├── db.py                    ← SQLite helpers (init + get_conn)
 ├── embed_utils.py           ← chunking + ChromaDB upsert (used by diary/media)
 ├── connections.py           ← find + explain related past notes via Claude
+├── dictation.py             ← Voice Capture seam: Whisper transcribe+translate → polish
+├── diary_markdown.py        ← pure helper: build the "## Raw voice transcript" section
 ├── ui.py                    ← CSS injection + UI components
 ├── requirements.txt
-├── .env                     ← ANTHROPIC_API_KEY, NOTION_TOKEN
+├── .env                     ← NOTION_TOKEN, ANTHROPIC_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY
+├── .env.example             ← template for the four keys above
 ├── .streamlit/
 │   └── config.toml          ← theme (iris violet #6e56cf, DM Sans)
 ├── data/
 │   ├── raw/                 ← markdown exports from Notion
-│   │   ├── diary/           ← diary entries saved as .md
-│   │   └── media/           ← media log entries saved as .md
+│   │   ├── diary/           ← diary entries saved as .md (+ raw voice transcript)
+│   │   └── media/           ← media log entries saved as .md (+ raw voice transcript)
 │   ├── chroma/              ← ChromaDB vector store
 │   └── brain.db             ← SQLite
 ├── pages/
 │   ├── chat.py              ← Chat page (RAG + streaming + session history)
-│   ├── diary.py             ← Daily Diary (interview → Claude synthesis → save)
-│   ├── media.py             ← Media Log (form → Claude follow-up → save)
+│   ├── diary.py             ← Daily Diary (interview → Claude synthesis → save); mic per answer
+│   ├── media.py             ← Media Log (form → Claude follow-up → save); mic on reaction + answer
 │   └── sync.py              ← Sync page (Notion pull + index rebuild)
+├── tests/                   ← pytest suite (dictate() seam + pure markdown helper)
+│   ├── conftest.py
+│   ├── test_dictation.py    ← the dictate() seam; network boundaries mocked
+│   └── test_diary_markdown.py
 └── Code Summary/
     └── codebase-summary.md  ← this file
 ```
@@ -65,6 +72,9 @@ Notion Second Brain (Code)/
 | Structured DB | SQLite | diary_entries, media_logs, chat_sessions |
 | Session management | JSON in SQLite `chat_sessions` | Chat history persists across app restarts |
 | Navigation | `st.navigation()` with `position="hidden"` | Custom sidebar buttons via `app.py` |
+| Voice mic | `st.audio_input()` (Streamlit native) | No third-party recorder dependency |
+| Transcribe-and-Translate | OpenAI Whisper `audio.translations` (`whisper-1`) | Mixed Urdu/English → English in one call; needs `OPENAI_API_KEY` |
+| Voice polish | `anthropic/claude-haiku-4-5` via OpenRouter | Cleans the raw transcript; reuses `OPENROUTER_API_KEY` |
 
 ---
 
@@ -73,6 +83,28 @@ Notion Second Brain (Code)/
 - **Palette:** sidebar `#12111c` (ink), body `#faf9f7` (warm white), accent `#6e56cf` (iris violet)
 - **Font:** DM Sans (body), DM Mono (timestamps/metadata)
 - **CSS:** injected via `ui.py`'s `apply_styles()` — called once in `app.py`
+
+---
+
+## Voice Capture (Dictation)
+
+Optional voice input on every free-text field of the Diary (5 answers) and Media Log (reaction + enrich answer) — never on Title or URL. Built on Streamlit's native `st.audio_input()` with no third-party recorder.
+
+**Pipeline** (all in `dictation.py`, the single test seam):
+
+```
+mic (st.audio_input) → dictate(audio_bytes, mode)
+    → Whisper audio.translations (whisper-1)   # mixed Urdu/English → English  [OPENAI_API_KEY]
+    → polish via claude-haiku-4-5 (OpenRouter)  # mode-specific cleanup        [OPENROUTER_API_KEY]
+    → { raw_transcript, polished_text }
+```
+
+- **`mode`** selects the polish: `"diary"` = light-touch (keep the speaker's phrasing, remove filler); `"media"` = medium (restructure a rough reaction into clean prose). Neither rewrites into an outward-facing voice.
+- **Injected before render:** `polished_text` is written to the field's `session_state` key before the widget instantiates, so it appears in the editable text area on rerun — the user edits/re-records before saving. Takes are md5-deduped so a recording is transcribed once.
+- **Failure handling:** a Whisper error → `TranscriptionError`; a missing `OPENAI_API_KEY` → `MissingAPIKeyError` (a distinct config error, *not* a `TranscriptionError`). Both are caught in the pages, so voice failing shows an inline error and leaves the field typeable — it never blocks writing the entry. A polish failure silently falls back to the raw transcript.
+- **Storage:** only the polished text flows into the normal save/embed path (indistinguishable from typing). The verbatim raw transcript is appended to the entry `.md` under `## Raw voice transcript` via `build_raw_transcript_section` and is **never embedded**. No schema change to `diary_entries` / `media_logs`.
+- **Form gotcha:** the Media reaction mic + text area sit *outside* `st.form("media_form")` — form widgets don't rerun until submit, which would prevent inject-before-render.
+- **Config:** needs `OPENAI_API_KEY` in `.env` (Whisper is its only consumer). Without it the mic still renders but every take falls into the graceful error path.
 
 ---
 
@@ -120,6 +152,16 @@ Called after every diary/media save. Finds top-3 related past notes and asks Cla
 - `find_connections(new_text, embed_model, collection, exclude_prefix)` — queries ChromaDB, deduplicates by source file, excludes the just-saved entry
 - `explain_connections(new_text, connections)` — single Claude call, numbered list response parsed into per-connection `explanation` keys
 
+### `dictation.py`
+The Voice Capture pipeline and the feature's sole test seam. `dictate(audio_bytes, mode) -> {raw_transcript, polished_text}`, in two internal steps:
+1. **Transcribe-and-Translate** — one OpenAI Whisper `audio.translations.create(model="whisper-1")` call turns mixed Urdu/English speech into English (`OPENAI_API_KEY`). A Whisper failure raises `TranscriptionError` and short-circuits (polish is never called).
+2. **Polish** — one `anthropic/claude-haiku-4-5` call via OpenRouter (`OPENROUTER_API_KEY`). `mode` selects the prompt: `"diary"` is light-touch (keep phrasing, remove filler); `"media"` is medium (restructure into clean prose). A polish failure falls back to the raw transcript so spoken words are never lost.
+
+`load_dotenv()` at import makes it self-sufficient outside Streamlit (scripts, tests). A missing `OPENAI_API_KEY` raises `MissingAPIKeyError` — a distinct configuration error, deliberately **not** a `TranscriptionError`, that the UI catches so a missing key degrades gracefully instead of crashing the page.
+
+### `diary_markdown.py`
+Pure, import-safe helper (no Streamlit/DB/network) so it is directly unit-testable. `build_raw_transcript_section(labels, raw_transcripts)` returns a `## Raw voice transcript` markdown section (each spoken answer under its label) or `""` when nothing was spoken — so a fully-typed entry's markdown is byte-for-byte unchanged. Reused by both `pages/diary.py` and `pages/media.py`.
+
 ### `ui.py`
 All CSS injected as a single `<style>` block via `st.markdown`. Components:
 - `apply_styles()` — call once per page to inject all CSS
@@ -151,6 +193,8 @@ State machine via `diary_step` (0–5) and `diary_saved`:
 
 `synthesize_entry(questions, answers)` — single Claude call (`max_tokens=400`), returns the synthesised entry text.
 
+**Voice Capture:** `_capture_voice_answer(step)` renders a native mic above each answer, calls `dictate(mode="diary")` on a new take (md5-deduped), and injects `polished_text` into `answer_{step}` before the text area renders so it lands in the editable field. Per-answer raw transcripts ride along in `diary_raw_transcripts` and are appended to the `.md` via `build_raw_transcript_section` on save. A `TranscriptionError`/`MissingAPIKeyError` surfaces an inline error and leaves the field typeable. Only the synthesis is embedded — never the raw transcript.
+
 Sidebar shows last 12 diary entries from SQLite in expanders.
 
 ### `pages/media.py`
@@ -163,12 +207,22 @@ State machine via `ml_step` ("form" → "enrich" → "done"):
 
 `generate_follow_up(title, media_type, reaction)` — Claude picks the most interesting angle (behaviour change, surprising idea, disagreement, connection to prior knowledge).
 
-`save_entry(title, url, media_type, rating, final_text)` — handles DB insert, `.md` file write, ChromaDB upsert, and connection finding. Returns `(connections, title, media_type, rating)`.
+`save_entry(title, url, media_type, rating, final_text, raw_section="")` — handles DB insert, `.md` file write (with the optional `## Raw voice transcript` section appended), ChromaDB upsert, and connection finding. Returns `(connections, title, media_type, rating)`. Only `final_text` (the polished reaction) is embedded — never the raw transcript.
+
+**Voice Capture:** `_capture_voice(field_key, label)` powers a native mic on both free-text fields — the reaction and the enrich follow-up answer (not Title/URL) — calling `dictate(mode="media")` (medium polish) and injecting `polished_text` before the field renders. **The reaction mic + text area live outside `st.form("media_form")`**: form widgets don't rerun until submit, so the record→inject-before-render pattern can't fire inside a form. `_voice_error` shows the inline `TranscriptionError`/`MissingAPIKeyError` fallback; `_reset_media_flow` clears per-field voice state on "Log another". Raw transcripts are appended to the `.md` via `build_raw_transcript_section` (labels: `Reaction`, then the follow-up question).
 
 ### `pages/sync.py`
 Two-button sync UI:
 - **Sync Notion** → calls `run_sync()` from `notion_import.py`; shows counts of new/skipped/failed pages; prompts to rebuild index if new pages were added
 - **Rebuild index** → calls `run_index()` from `indexer.py`; shows chunk/file counts on completion
+
+### `tests/`
+Pytest suite (dependency-light; no network or keys needed). Per the feature's testing decisions, Streamlit widget wiring / session_state injection / reruns are deliberately **not** unit-tested — the boundaries under test are the non-UI seams.
+- `test_dictation.py` — the `dictate()` seam, with the Whisper client and OpenRouter call mocked: raw transcript preserved verbatim, diary vs media polish routing, a Whisper failure short-circuits before polish, a polish failure falls back to raw, and a missing key raises `MissingAPIKeyError` (not a `TranscriptionError`).
+- `test_diary_markdown.py` — `build_raw_transcript_section` (pure, nothing mocked): nothing-spoken → `""`, spoken answers recorded verbatim under their labels.
+- `conftest.py` — shared fixtures.
+
+Run: `./venv/bin/python -m pytest`
 
 ---
 
@@ -182,6 +236,8 @@ Two-button sync UI:
 
 All three land in the same ChromaDB collection (`second_brain`) and are queried together.
 
+**Voice note:** for spoken diary/media entries, only the polished text (diary synthesis / media reaction) is embedded — exactly as a typed entry. The verbatim **raw transcript** is written to the entry's `.md` under `## Raw voice transcript` for the record only; it is never embedded or searched, so voice and typed entries are indistinguishable downstream.
+
 ---
 
 ## Cost Profile
@@ -194,8 +250,10 @@ All embedding and vector search runs locally (free). Claude API is called for:
 | Diary synthesis | claude-sonnet-4-6 | ~600 in / ~400 out | ~$0.001 |
 | Media follow-up | claude-sonnet-4-6 | ~200 in / ~120 out | ~$0.0005 |
 | Connections explanation | claude-sonnet-4-6 | ~800 in / ~300 out | ~$0.001 |
+| Voice transcribe+translate | Whisper `whisper-1` (OpenAI) | per ~minute of audio | ~$0.006/min |
+| Voice polish | claude-haiku-4-5 (OpenRouter) | ~200 in / ~150 out | ~$0.0002 |
 
-Daily diary + a few chats ≈ well under $0.10/day.
+Voice is opt-in and cheap: a full spoken diary is up to 5 Whisper + 5 Haiku calls. Daily diary + a few chats ≈ well under $0.10/day. Embedding and vector search stay local and free; audio is the only egress to OpenAI (everything else is OpenRouter or local).
 
 ---
 
