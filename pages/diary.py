@@ -15,7 +15,7 @@ sys.path.insert(0, ROOT)
 from db import init_db, get_conn
 from embed_utils import upsert_document, load_embed_model, load_collection
 from connections import find_connections, explain_connections
-from dictation import dictate, TranscriptionError
+from dictation import dictate, TranscriptionError, MissingAPIKeyError
 from diary_markdown import build_raw_transcript_section
 from ui import question_card, connection_card
 
@@ -77,9 +77,10 @@ def _capture_voice_answer(step):
     try:
         with st.spinner("Transcribing and polishing…"):
             result = dictate(audio_bytes, mode="diary")
-    except TranscriptionError as exc:
+    except (TranscriptionError, MissingAPIKeyError) as exc:
         # Graceful fallback: surface the error, leave the field typeable, let the
-        # user re-record. Voice failing must never block writing the entry.
+        # user re-record. Voice failing — whether the Whisper call or a missing
+        # OPENAI_API_KEY — must never block writing the entry.
         st.session_state[f"dictation_error_{step}"] = str(exc)
         return
 

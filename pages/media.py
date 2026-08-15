@@ -2,6 +2,7 @@
 pages/media.py — Media Log with Claude take enrichment.
 """
 
+import hashlib
 import os
 import sys
 import datetime
@@ -14,6 +15,8 @@ sys.path.insert(0, ROOT)
 from db import init_db, get_conn
 from embed_utils import upsert_document, load_embed_model, load_collection
 from connections import find_connections, explain_connections
+from dictation import dictate, TranscriptionError, MissingAPIKeyError
+from diary_markdown import build_raw_transcript_section
 from ui import connection_card
 
 RAW_MEDIA_DIR = os.path.join(ROOT, "data", "raw", "media")
@@ -47,7 +50,7 @@ def generate_follow_up(title, media_type, reaction):
     return response.content[0].text.strip()
 
 
-def save_entry(title, url, media_type, rating, final_text):
+def save_entry(title, url, media_type, rating, final_text, raw_section=""):
     now = datetime.datetime.now()
     date_str = now.date().isoformat()
     slug = (title or "untitled").lower().replace(" ", "-")[:40]
@@ -64,6 +67,12 @@ def save_entry(title, url, media_type, rating, final_text):
         f"---\ntitle: {title}\nmedia_type: {media_type}\nrating: {rating}\n"
         f"url: {url}\ncreated: {date_str}\nsource: media\n---\n\n{final_text.strip()}\n"
     )
+    # Any spoken answer's Raw Transcript rides along in the markdown record only —
+    # it is never embedded (embed_text below still sees just the Polished Text), so
+    # a voice reaction and a typed one index identically. ``raw_section`` is "" for a
+    # fully-typed entry, leaving md_content byte-for-byte what it was before voice.
+    if raw_section:
+        md_content += "\n" + raw_section
     with open(os.path.join(RAW_MEDIA_DIR, filename), "w", encoding="utf-8") as f:
         f.write(md_content)
 
@@ -95,6 +104,80 @@ def save_entry(title, url, media_type, rating, final_text):
         conns = explain_connections(embed_text, raw)
 
     return conns, title, media_type, rating
+
+
+# ---------------------------------------------------------------------------
+# Voice Capture
+# ---------------------------------------------------------------------------
+
+def _capture_voice(field_key, label):
+    """Render the mic (``label`` is its accessible name) for the free-text field
+    stored under ``field_key`` and, on a new recording, inject the media Polished
+    Text into that key before the text area below renders.
+
+    Mirrors diary's ``_capture_voice_answer`` — the same seam (``dictate``), the
+    same md5 de-dupe, the same inject-before-render — but routes through
+    ``mode="media"`` for the medium polish (a rough out-loud reaction restructured
+    into clean prose). Both media mics (the reaction and the enrich answer) share
+    this helper; ``field_key`` (``"ml_reaction"`` / ``"ml_answer"``) namespaces the
+    per-field widget and Voice Capture state so the two never collide.
+
+    Voice Capture is optional and additive — a failure never blocks typing. Needs
+    ``OPENAI_API_KEY`` in ``.env`` for Whisper; without it the mic still renders but
+    every take falls into the graceful error path below.
+    """
+    recording = st.audio_input(
+        label,
+        key=f"audio_{field_key}",
+        label_visibility="collapsed",
+    )
+    if recording is None:
+        return
+
+    audio_bytes = recording.getvalue()
+    audio_hash = hashlib.md5(audio_bytes).hexdigest()
+    if st.session_state.get(f"audio_hash_{field_key}") == audio_hash:
+        return  # already handled this take — don't overwrite the user's edits
+    st.session_state[f"audio_hash_{field_key}"] = audio_hash
+
+    try:
+        with st.spinner("Transcribing and polishing…"):
+            result = dictate(audio_bytes, mode="media")
+    except (TranscriptionError, MissingAPIKeyError) as exc:
+        # Graceful fallback: surface the error, leave the field typeable, let the
+        # user re-record. Voice failing — whether the Whisper call or a missing
+        # OPENAI_API_KEY — must never block logging the entry.
+        st.session_state[f"dictation_error_{field_key}"] = str(exc)
+        return
+
+    st.session_state.pop(f"dictation_error_{field_key}", None)
+    # Written before the text area is instantiated, so the Polished Text lands in
+    # the editable field on this run. The Raw Transcript rides along to be appended
+    # to the entry's markdown on save (never embedded).
+    st.session_state[field_key] = result["polished_text"]
+    st.session_state[f"raw_transcript_{field_key}"] = result["raw_transcript"]
+
+
+def _voice_error(field_key, noun):
+    """Show the inline Voice Capture error for ``field_key`` if the last take failed."""
+    if st.session_state.get(f"dictation_error_{field_key}"):
+        st.error(
+            f"Voice transcription failed — type your {noun} instead, or re-record. "
+            f"({st.session_state[f'dictation_error_{field_key}']})"
+        )
+
+
+def _reset_media_flow():
+    """Return the media flow to a clean slate, clearing per-field widget and Voice
+    Capture state so a new log never inherits a previous one's text or a stale
+    recording. Safe to call from the reset buttons: neither free-text widget is
+    instantiated on the ``done`` view, so deleting their keys can't conflict with an
+    on-page widget."""
+    for _k, _v in _defaults.items():
+        st.session_state[_k] = _v
+    for field_key in ("ml_reaction", "ml_answer"):
+        for prefix in ("", "audio_", "audio_hash_", "raw_transcript_", "dictation_error_"):
+            st.session_state.pop(f"{prefix}{field_key}", None)
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +250,21 @@ st.markdown("---")
 # ---------------------------------------------------------------------------
 
 if st.session_state.ml_step == "form":
+    # Voice Capture + the reaction field live OUTSIDE the form. Widgets inside an
+    # st.form don't rerun until submit, so the record→transcribe→inject-before-render
+    # pattern can't fire in there. Kept outside, a fresh recording reruns the page and
+    # its Polished Text is injected into ``ml_reaction`` before the text area renders.
+    # The structured fields (Title/URL/Type/Rating) and "Log it" stay in the form; on
+    # submit the reaction is read from its session_state key.
+    _capture_voice("ml_reaction", "Record your reaction")
+    reaction = st.text_area(
+        "Your reaction",
+        key="ml_reaction",
+        height=160,
+        placeholder="What did you take away? What surprised you? What do you disagree with?",
+    )
+    _voice_error("ml_reaction", "reaction")
+
     with st.form("media_form"):
         title = st.text_input("Title", placeholder="The Mom Test, Lex Fridman #400…")
         url = st.text_input("URL", placeholder="https://… (optional)")
@@ -177,11 +275,6 @@ if st.session_state.ml_step == "form":
             value=3,
             format_func=lambda x: STAR_LABELS[x],
         )
-        reaction = st.text_area(
-            "Your reaction",
-            height=160,
-            placeholder="What did you take away? What surprised you? What do you disagree with?",
-        )
         submitted = st.form_submit_button("Log it")
 
     if submitted:
@@ -191,6 +284,8 @@ if st.session_state.ml_step == "form":
             st.session_state.ml_data = {
                 "title": title, "url": url, "media_type": media_type,
                 "rating": rating, "reaction": reaction,
+                # Carry the reaction's Raw Transcript (if spoken) forward to save.
+                "reaction_raw": st.session_state.get("raw_transcript_ml_reaction", ""),
             }
             with st.spinner("One follow-up question…"):
                 question = generate_follow_up(title, media_type, reaction)
@@ -219,23 +314,39 @@ elif st.session_state.ml_step == "enrich":
     </div>
     """, unsafe_allow_html=True)
 
+    # The enrich answer is a plain text_area (not in a form), so it mirrors diary's
+    # mic directly: capture runs before the field so a fresh take's Polished Text is
+    # injected into ``ml_answer`` in time to show on this run.
+    _capture_voice("ml_answer", "Record your answer")
     answer = st.text_area(
         "Your answer",
+        key="ml_answer",
         height=120,
         placeholder="Optional — skip to save as-is.",
         label_visibility="collapsed",
     )
+    _voice_error("ml_answer", "answer")
 
     col1, col2 = st.columns([2, 3])
     with col1:
         if st.button("Add to entry", type="primary"):
+            answered = bool(answer.strip())
             final_text = (
                 d["reaction"].strip() + "\n\n"
                 + st.session_state.ml_question + "\n"
                 + answer.strip()
-            ) if answer.strip() else d["reaction"].strip()
+            ) if answered else d["reaction"].strip()
+            # Record the Raw Transcript per spoken field under its label. The answer's
+            # transcript is included only when the answer is part of the entry.
+            raw_section = build_raw_transcript_section(
+                ["Reaction", st.session_state.ml_question],
+                [
+                    d.get("reaction_raw", ""),
+                    st.session_state.get("raw_transcript_ml_answer", "") if answered else "",
+                ],
+            )
             conns, sv_title, sv_type, sv_rating = save_entry(
-                d["title"], d["url"], d["media_type"], d["rating"], final_text
+                d["title"], d["url"], d["media_type"], d["rating"], final_text, raw_section
             )
             st.session_state.ml_connections = conns
             st.session_state.ml_saved_title = sv_title
@@ -245,8 +356,11 @@ elif st.session_state.ml_step == "enrich":
             st.rerun()
     with col2:
         if st.button("Skip enrichment"):
+            raw_section = build_raw_transcript_section(
+                ["Reaction"], [d.get("reaction_raw", "")]
+            )
             conns, sv_title, sv_type, sv_rating = save_entry(
-                d["title"], d["url"], d["media_type"], d["rating"], d["reaction"]
+                d["title"], d["url"], d["media_type"], d["rating"], d["reaction"], raw_section
             )
             st.session_state.ml_connections = conns
             st.session_state.ml_saved_title = sv_title
@@ -294,6 +408,5 @@ elif st.session_state.ml_step == "done":
 
     st.markdown("---")
     if st.button("Log another", type="primary"):
-        for _k, _v in _defaults.items():
-            st.session_state[_k] = _v
+        _reset_media_flow()
         st.rerun()
