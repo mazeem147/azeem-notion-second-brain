@@ -116,12 +116,16 @@ def test_transcription_error_message_is_clear(wire):
 
 
 def test_missing_openai_key_is_a_config_error_not_a_transcription_failure(wire, monkeypatch):
-    # A missing key is a misconfiguration, not a Whisper failure — it must not be
-    # dressed up as a TranscriptionError (which would blame the audio/the call).
+    # A missing key is a misconfiguration, not a Whisper failure — it surfaces as a
+    # distinct MissingAPIKeyError (never a TranscriptionError, which would blame the
+    # audio/the call). It is still a clear, catchable error the Voice Capture UI
+    # handles gracefully rather than crashing the page.
     wire()
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    with pytest.raises(KeyError):
+    with pytest.raises(dictation.MissingAPIKeyError):
         dictation.dictate(b"audio", mode="diary")
+    # It must be its own type, not dressed up as a transcription failure.
+    assert not issubclass(dictation.MissingAPIKeyError, dictation.TranscriptionError)
 
 
 # ── A Polish failure preserves the raw transcript (Stories 12, 17) ────────────

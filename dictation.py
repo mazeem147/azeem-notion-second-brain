@@ -23,6 +23,8 @@ Design contract that the tests pin down:
 - ``raw_transcript`` is the verbatim Whisper output, never altered by polishing.
 - A Whisper failure surfaces as a clear error and short-circuits — Polish is not
   called, so a transcription problem is never silently masked.
+- A missing ``OPENAI_API_KEY`` surfaces as ``MissingAPIKeyError`` (a configuration
+  problem), distinct from a ``TranscriptionError`` so it never blames the audio.
 - A Polish failure still returns the Raw Transcript as the Polished Text, so the
   user's spoken words are never lost.
 """
@@ -84,6 +86,18 @@ class TranscriptionError(RuntimeError):
     """
 
 
+class MissingAPIKeyError(RuntimeError):
+    """Raised when ``OPENAI_API_KEY`` is absent, so a misconfiguration surfaces as
+    itself rather than as a :class:`TranscriptionError` (which would wrongly blame
+    the audio or the Whisper call). Deliberately NOT a subclass of
+    ``TranscriptionError``.
+
+    It is still a clear, catchable error: the Voice Capture UI catches it alongside
+    ``TranscriptionError`` so a missing key degrades gracefully to a typeable field
+    ("add OPENAI_API_KEY to .env") instead of crashing the page.
+    """
+
+
 def dictate(audio_bytes: bytes, mode: str) -> dict:
     """Turn a Voice Capture into ``{raw_transcript, polished_text}``.
 
@@ -127,9 +141,14 @@ def _transcribe_and_translate(audio_bytes: bytes) -> str:
     the record preserved in markdown is truly what was said.
     """
     # Read the key outside the try: a missing OPENAI_API_KEY is a configuration
-    # error and should surface as such, not be dressed up as a transcription
-    # failure (which would wrongly imply the audio or the Whisper call was at fault).
-    api_key = os.environ["OPENAI_API_KEY"]
+    # error and should surface as such (MissingAPIKeyError), not be dressed up as a
+    # transcription failure (which would wrongly imply the audio or the Whisper call
+    # was at fault). The Voice Capture UI catches this alongside TranscriptionError.
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise MissingAPIKeyError(
+            "OPENAI_API_KEY is not set — add it to .env to use the voice mic."
+        )
     try:
         client = OpenAI(api_key=api_key)
         buf = io.BytesIO(audio_bytes)
